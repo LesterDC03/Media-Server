@@ -105,9 +105,21 @@ def scan_library() -> None:
 # FFmpeg remuxing (MKV -> MP4)
 # --------------------------------------------------------------------------- #
 
+def output_dir(mkv: Path) -> Path:
+    """Folder that holds everything generated from this MKV."""
+    if mkv.parent.name == mkv.stem:        # MKV already sits in its own folder
+        return mkv.parent
+    return mkv.parent / mkv.stem
+
+
+def output_mp4(mkv: Path) -> Path:
+    return output_dir(mkv) / (mkv.stem + ".mp4")
+
+
 def pending_conversions():
-    """MKV files that do not yet have a sibling .mp4 with the same name."""
-    return [m for m in _walk(".mkv") if not m.with_suffix(".mp4").exists()]
+    """MKV files with no MP4 yet, either in the new folder or the old spot beside the MKV."""
+    return [m for m in _walk(".mkv")
+            if not output_mp4(m).exists() and not m.with_suffix(".mp4").exists()]
 
 def needs_video_reencode(src: Path) -> bool:
     """True if the video is not 8-bit H.264 (phones often can't play it)."""
@@ -148,6 +160,35 @@ def probe_tracks(path: Path, kind: str):
                     "lang": tags.get("language", "und"),
                     "title": tags.get("title", "")})
     return out
+TEXT_SUB_CODECS = {"subrip", "ass", "ssa", "mov_text", "webvtt", "text"}
+
+
+def extract_subtitles(mkv: Path) -> None:
+    """Write each text subtitle track of the MKV beside the MP4 as Name.<lang>.srt.
+    Picture-based tracks (PGS, VobSub) are skipped because they can't become text."""
+    used = set()
+    for s in probe_tracks(mkv, "s"):
+        if s["codec"] not in TEXT_SUB_CODECS:
+            continue
+        lang = re.sub(r"[^A-Za-z0-9-]", "", s["lang"]) or "und"
+        label, k = lang, 1
+        while label in used:                   # two tracks, same language
+            k += 1
+            label = f"{lang}{k}"
+        used.add(label)
+        out = output_dir(mkv) / f"{mkv.stem}.{label}.srt"
+        if out.exists():                       # never overwrite a file you may have edited
+            continue
+        r = subprocess.run(
+            [FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", str(mkv),
+             "-map", f"0:s:{s['n']}", "-c:s", "srt", str(out)],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            out.unlink(missing_ok=True)
+            print(f"[subs] could not extract track {s['n']} of {mkv.name}")
+        else:
+            print(f"[subs] wrote {out.name}")
 
 def remux(mkv: Path) -> bool:
     """
@@ -156,7 +197,8 @@ def remux(mkv: Path) -> bool:
     spaces and special characters in file names are handled safely.
     Output goes to a temp file first, so a crash never leaves a broken .mp4.
     """
-    mp4 = mkv.with_suffix(".mp4")
+    mp4 = output_mp4(mkv)
+    mp4.parent.mkdir(parents=True, exist_ok=True)
     tmp = mp4.with_name(mp4.stem + ".part.mp4")
     if needs_video_reencode(mkv):
         print(f"[remux] re-encoding video to H.264: {mkv.name}")
@@ -182,6 +224,10 @@ def remux(mkv: Path) -> bool:
             return False
         os.replace(tmp, mp4)
         print(f"[remux] done   {mkv.name}")
+        try:
+            extract_subtitles(mkv)             # a subtitle problem must not fail the movie
+        except Exception as exc:
+            print(f"[subs] error: {exc}")
         return True
     finally:
         if tmp.exists():
@@ -236,7 +282,7 @@ def audio_variant(vid: str, src: Path, n: int) -> Path:
     """MP4 copy of `src` that contains only audio track n. Built once, then cached."""
     if not FFMPEG or n < 0 or n >= len(probe_tracks(src, "a")):
         abort(404)
-    cache = MEDIA_DIR / AUDIO_DIRNAME
+    cache = src.parent / AUDIO_DIRNAME      # src is the movie's MP4, so this is its own folder
     cache.mkdir(exist_ok=True)
     out = cache / f"{vid}_a{n}.mp4"
 
@@ -265,7 +311,41 @@ def audio_variant(vid: str, src: Path, n: int) -> Path:
 @app.get("/api/tracks/<vid>")
 def api_tracks(vid):
     path = _lookup(vid)
-    return jsonify({"audio": probe_tracks(path, "a"), "subs": []})
+    return jsonify({
+        "audio": probe_tracks(path, "a"),
+        "subs": [{"n": i, "label": s["label"]}
+                 for i, s in enumerate(find_subtitles(path))],
+    })
+def find_subtitles(video: Path):
+    """Sidecar subtitles: 'Movie.srt' or 'Movie.en.srt' next to 'Movie.mp4'."""
+    found = []
+    for f in sorted(video.parent.glob("*.srt")):
+        if f.stem == video.stem:
+            label = "Subtitles"
+        elif f.stem.startswith(video.stem + "."):
+            label = f.stem[len(video.stem) + 1:]
+        else:
+            continue
+        found.append({"file": f, "label": label})
+    return found
+
+
+@app.get("/subs/<vid>/<int:n>.vtt")
+def subtitle(vid, n):
+    """Browsers only understand WebVTT, so convert the .srt on the fly."""
+    subs = find_subtitles(_lookup(vid))
+    if n >= len(subs):
+        abort(404)
+    raw = subs[n]["file"].read_bytes()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("cp1252", errors="replace")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(                              # 00:01:02,500 -> 00:01:02.500 (timing lines only)
+        r"^(\d{2}:\d{2}:\d{2}),(\d{3}) --> (\d{2}:\d{2}:\d{2}),(\d{3})",
+        r"\1.\2 --> \3.\4", text, flags=re.M)
+    return Response("WEBVTT\n\n" + text, mimetype="text/vtt")
 
 @app.get("/")
 def index():
@@ -344,9 +424,7 @@ def poster(vid):
     path = _lookup(vid)
     if not FFMPEG:
         abort(404)
-    cache = MEDIA_DIR / POSTER_DIRNAME
-    cache.mkdir(exist_ok=True)
-    out = cache / f"{vid}.jpg"
+    out = path.with_name(path.stem + ".poster.jpg")
     if not out.exists() or out.stat().st_size == 0:
         with _poster_slots:
             for ss in ("30", "5", "0"):                  # fall back for short videos
@@ -524,7 +602,15 @@ async function loadTracks(it) {
   try {
     const t = await (await fetch('/api/tracks/' + it.id)).json();
     if (current !== it) return;              // player was closed or changed meanwhile
-    /* PART 2: subtitle <track> code goes here */
+    for (const s of t.subs) {
+      const tr = document.createElement('track');
+      const isCode = /^[a-z]{2,3}$/i.test(s.label);
+      tr.kind = 'subtitles';
+      tr.label = isCode ? langName(s.label) : s.label;
+      if (isCode) tr.srclang = s.label;
+      tr.src = '/subs/' + it.id + '/' + s.n + '.vtt';
+      video.append(tr);
+    }
     if (t.audio.length < 2) return;          // nothing to choose from
     for (const a of t.audio) {
       const o = document.createElement('option');
