@@ -1,0 +1,19 @@
+# Your media (never publish these)
+media/
+.posters/
+*.mkv
+*.mp4
+*.avi
+*.mov
+*.m4v
+*.webm
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# OS junk
+.DS_Store
+Thumbs.db
