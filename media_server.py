@@ -24,6 +24,7 @@ Requires FFmpeg on PATH (https://ffmpeg.org/download.html).
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -42,6 +43,7 @@ from flask import Flask, Response, abort, jsonify, request, send_file
 CHUNK_SIZE = 1024 * 512          # bytes read per iteration while streaming
 RESCAN_SECONDS = 20              # how often the worker looks for new files
 POSTER_DIRNAME = ".posters"      # cached thumbnails live inside the media dir
+AUDIO_DIRNAME = ".audio"         # cached single-language copies live here
 
 app = Flask(__name__)
 
@@ -58,6 +60,7 @@ state = {
     "failed": [],                # names of files FFmpeg could not convert
 }
 _poster_slots = threading.Semaphore(2)   # limit parallel thumbnail jobs
+_variant_lock = threading.Lock()         # one audio-copy job at a time
 
 
 # --------------------------------------------------------------------------- #
@@ -122,6 +125,30 @@ def needs_video_reencode(src: Path) -> bool:
     except Exception:
         return False
 
+def probe_tracks(path: Path, kind: str):
+    """List audio ('a') or subtitle ('s') streams of a file.
+    Returns e.g. [{'n': 0, 'codec': 'aac', 'lang': 'eng', 'title': ''}, ...]
+    where n is the position among streams of that kind (0 = first)."""
+    if not FFPROBE:
+        return []
+    try:
+        r = subprocess.run(
+            [FFPROBE, "-v", "error", "-select_streams", kind,
+             "-show_entries", "stream=codec_name:stream_tags=language,title",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        streams = json.loads(r.stdout or "{}").get("streams", [])
+    except Exception:
+        return []
+    out = []
+    for n, s in enumerate(streams):
+        tags = s.get("tags", {})
+        out.append({"n": n, "codec": s.get("codec_name", ""),
+                    "lang": tags.get("language", "und"),
+                    "title": tags.get("title", "")})
+    return out
+
 def remux(mkv: Path) -> bool:
     """
     Equivalent to:  ffmpeg -i input.mkv -c:v copy -c:a aac output.mp4
@@ -140,9 +167,10 @@ def remux(mkv: Path) -> bool:
     cmd = [
         FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
         "-i", str(mkv),
-        "-map", "0:v:0", "-map", "0:a:0?",   # first video + first audio (if any)
+        "-map", "0:v:0", "-map", "0:a?",     # first video + ALL audio tracks
         *video_args,
         "-c:a", "aac", "-b:a", "192k",       # browsers need AAC
+        "-ac", "2",                          # stereo: keeps dialogue audible everywhere
         "-sn", "-dn",                        # drop subtitles/data (MP4 can't hold most)
         "-movflags", "+faststart",           # put the index up front for instant start
         str(tmp),
@@ -204,6 +232,40 @@ def _human_size(n: int) -> str:
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024
 
+def audio_variant(vid: str, src: Path, n: int) -> Path:
+    """MP4 copy of `src` that contains only audio track n. Built once, then cached."""
+    if not FFMPEG or n < 0 or n >= len(probe_tracks(src, "a")):
+        abort(404)
+    cache = MEDIA_DIR / AUDIO_DIRNAME
+    cache.mkdir(exist_ok=True)
+    out = cache / f"{vid}_a{n}.mp4"
+
+    def fresh():
+        return (out.exists() and out.stat().st_size > 0
+                and out.stat().st_mtime >= src.stat().st_mtime)
+
+    with _variant_lock:                       # other requests wait, then find it ready
+        if not fresh():
+            tmp = cache / f"{vid}_a{n}.part.mp4"
+            print(f"[audio] building track {n + 1} for {src.name}")
+            r = subprocess.run(
+                [FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
+                 "-map", "0:v:0", "-map", f"0:a:{n}", "-c", "copy",
+                 "-movflags", "+faststart", str(tmp)],
+                capture_output=True, text=True,
+            )
+            if r.returncode != 0 or not tmp.exists():
+                tmp.unlink(missing_ok=True)
+                print(f"[audio] FAILED {src.name}\n{r.stderr.strip()}")
+                abort(500)
+            os.replace(tmp, out)
+    return out
+
+
+@app.get("/api/tracks/<vid>")
+def api_tracks(vid):
+    path = _lookup(vid)
+    return jsonify({"audio": probe_tracks(path, "a"), "subs": []})
 
 @app.get("/")
 def index():
@@ -231,9 +293,11 @@ def api_status():
 def stream(vid):
     """Serve an MP4 honouring HTTP Range headers (206 Partial Content)."""
     path = _lookup(vid)
+    track = request.args.get("a", default=0, type=int)
+    if track > 0:                              # an alternate language was requested
+        path = audio_variant(vid, path, track)
     size = path.stat().st_size
     start, end, status = 0, size - 1, 200
-
     range_header = request.headers.get("Range")
     if range_header:
         m = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
@@ -361,6 +425,8 @@ main{padding:0 max(1.25rem,env(safe-area-inset-right)) 3rem max(1.25rem,env(safe
 .ptop button:hover{background:#2a2a2a}
 .ptop button:focus-visible{outline:2px solid var(--accent)}
 #ptitle{margin:0;font-size:1.05rem;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ptop select{margin-left:auto;padding:.5rem .9rem;border-radius:6px;border:1px solid #444;
+  background:#1a1a1a;color:var(--text);font:inherit;max-width:50vw}
 #video{flex:1;min-height:0;width:100%;background:#000}
 #perr{margin:0;padding:.8rem 1rem;background:#2b1818;color:#f3b6b6;font-size:.95rem}
 
@@ -383,6 +449,7 @@ main{padding:0 max(1.25rem,env(safe-area-inset-right)) 3rem max(1.25rem,env(safe
   <div class="ptop">
     <button id="close" type="button">Back to library</button>
     <h2 id="ptitle"></h2>
+    <select id="atrack" aria-label="Audio track" hidden></select>
   </div>
   <video id="video" controls playsinline preload="metadata"></video>
   <p id="perr" hidden>This file can't be played in this browser. It may use a video codec (such as HEVC) the browser doesn't support. Try Safari, or another device.</p>
@@ -392,6 +459,7 @@ main{padding:0 max(1.25rem,env(safe-area-inset-right)) 3rem max(1.25rem,env(safe
 const $ = s => document.querySelector(s);
 const grid = $('#grid'), empty = $('#empty'), search = $('#search'), banner = $('#banner');
 const modal = $('#player'), video = $('#video'), ptitle = $('#ptitle'), perr = $('#perr');
+const atrack = $('#atrack');
 let items = [], current = null, lastSave = 0, version = -1, mediaDir = '';
 
 /* ---- resume positions (per browser) ---- */
@@ -445,6 +513,38 @@ function render() {
 search.addEventListener('input', render);
 
 /* ---- player ---- */
+const langName = c => {
+  try { return new Intl.DisplayNames(['en'], { type: 'language' }).of(c) || c; }
+  catch { return c; }
+};
+
+async function loadTracks(it) {
+  atrack.hidden = true; atrack.replaceChildren();
+  video.querySelectorAll('track').forEach(el => el.remove());
+  try {
+    const t = await (await fetch('/api/tracks/' + it.id)).json();
+    if (current !== it) return;              // player was closed or changed meanwhile
+    /* PART 2: subtitle <track> code goes here */
+    if (t.audio.length < 2) return;          // nothing to choose from
+    for (const a of t.audio) {
+      const o = document.createElement('option');
+      o.value = a.n;
+      o.textContent = langName(a.lang) + (a.title ? ' - ' + a.title : '') + '  (track ' + (a.n + 1) + ')';
+      atrack.append(o);
+    }
+    atrack.value = '0'; atrack.hidden = false;
+  } catch {}
+}
+
+atrack.addEventListener('change', () => {
+  const t = video.currentTime, wasPlaying = !video.paused;
+  video.onloadedmetadata = () => {
+    video.currentTime = t;
+    if (wasPlaying) video.play().catch(() => {});
+  };
+  video.src = '/stream/' + current.id + (atrack.value !== '0' ? '?a=' + atrack.value : '');
+});
+
 function openPlayer(it) {
   current = it; perr.hidden = true; ptitle.textContent = it.title;
   modal.hidden = false; document.body.classList.add('lock');
@@ -453,6 +553,7 @@ function openPlayer(it) {
     if (pos && pos.t > 5 && pos.t < video.duration - 30) video.currentTime = pos.t;
   };
   video.src = '/stream/' + it.id;
+  loadTracks(it);
   video.play().catch(() => {});          // some browsers require a tap; controls are visible
   history.pushState({ p: 1 }, '');       // so the phone's Back button closes the player
   $('#close').focus();
@@ -467,6 +568,7 @@ function hidePlayer() {
   video.pause(); save();
   current = null;
   video.removeAttribute('src'); video.load();   // release the connection
+  atrack.hidden = true;
   modal.hidden = true; document.body.classList.remove('lock');
   render();
 }
