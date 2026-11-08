@@ -344,7 +344,7 @@ def subtitle(vid, n):
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(                              # 00:01:02,500 -> 00:01:02.500 (timing lines only)
         r"^(\d{2}:\d{2}:\d{2}),(\d{3}) --> (\d{2}:\d{2}:\d{2}),(\d{3})",
-        r"\1.\2 --> \3.\4", text, flags=re.M)
+        r"\1.\2 --> \3.\4 line:85%", text, flags=re.M)
     return Response("WEBVTT\n\n" + text, mimetype="text/vtt")
 
 @app.get("/")
@@ -507,7 +507,12 @@ main{padding:0 max(1.25rem,env(safe-area-inset-right)) 3rem max(1.25rem,env(safe
   background:#1a1a1a;color:var(--text);font:inherit;max-width:50vw}
 #video{flex:1;min-height:0;width:100%;background:#000}
 #perr{margin:0;padding:.8rem 1rem;background:#2b1818;color:#f3b6b6;font-size:.95rem}
-
+#video::cue{
+  font-size:120%;
+  color:#fff;
+  background:rgba(0,0,0,.6);
+  font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
 @media (prefers-reduced-motion:reduce){.art{transition:none}.card:hover .art{transform:none}}
 </style>
 </head>
